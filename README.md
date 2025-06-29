@@ -2,6 +2,10 @@
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.ai) server that provides stealth browser capabilities using Playwright with anti-detection techniques. This server allows MCP clients to navigate to websites and take screenshots while evading common bot detection systems.
 
+<a href="https://glama.ai/mcp/servers/efxcqjoq01">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/efxcqjoq01/badge" alt="Stealth Browser Server MCP server" />
+</a>
+
 ## Features
 
 - **Stealth Mode**: Uses [puppeteer-extra-plugin-stealth](https://github.com/berstend/puppeteer-extra/tree/master/packages/puppeteer-extra-plugin-stealth) with [playwright-extra](https://github.com/berstend/puppeteer-extra/tree/master/packages/playwright-extra) to bypass bot detections
