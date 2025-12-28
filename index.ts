@@ -6,9 +6,40 @@ import * as OTPAuth from 'otpauth';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { Browser, Page } from 'playwright';
+import { randomUUID } from 'crypto';
 
 // Add the stealth plugin to playwright
 chromium.use(StealthPlugin());
+
+// Session storage for persistent browser instances
+interface BrowserSession {
+  browser: Browser;
+  page: Page;
+  createdAt: Date;
+}
+
+const sessions = new Map<string, BrowserSession>();
+
+// Session cleanup: remove sessions older than 30 minutes
+function cleanupStaleSessions(): void {
+  const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+  const staleSessionIds: string[] = [];
+
+  for (const [sessionId, session] of sessions.entries()) {
+    if (session.createdAt < thirtyMinutesAgo) {
+      staleSessionIds.push(sessionId);
+    }
+  }
+
+  for (const sessionId of staleSessionIds) {
+    const session = sessions.get(sessionId);
+    if (session) {
+      session.browser.close().catch(err => console.error(`Error closing stale session ${sessionId}:`, err));
+      sessions.delete(sessionId);
+      console.error(`Cleaned up stale session: ${sessionId}`);
+    }
+  }
+}
 
 // Browser launch options for Microsoft Edge on Windows (via WSL)
 // Can be overridden with BROWSER_PATH environment variable
@@ -53,22 +84,37 @@ async function screenshotOnError(page: Page, error: Error): Promise<void> {
   }
 }
 
+// Helper: Validate cookie path to prevent path traversal
+function validateCookiePath(cookiesPath: string): string {
+  const allowedBase = process.env.COOKIES_BASE_DIR || process.cwd();
+  const resolvedPath = path.resolve(cookiesPath);
+  const resolvedBase = path.resolve(allowedBase);
+
+  if (!resolvedPath.startsWith(resolvedBase)) {
+    throw new Error(`Cookie path must be within ${resolvedBase}`);
+  }
+
+  return resolvedPath;
+}
+
 // Helper: Save cookies to file
 async function saveCookies(page: Page, cookiesPath: string): Promise<void> {
+  const validatedPath = validateCookiePath(cookiesPath);
   const cookies = await page.context().cookies();
-  const dir = path.dirname(cookiesPath);
+  const dir = path.dirname(validatedPath);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(cookiesPath, JSON.stringify(cookies, null, 2));
-  console.error(`Saved ${cookies.length} cookies to ${cookiesPath}`);
+  await fs.writeFile(validatedPath, JSON.stringify(cookies, null, 2));
+  console.error(`Saved ${cookies.length} cookies to ${validatedPath}`);
 }
 
 // Helper: Load cookies from file
 async function loadCookies(page: Page, cookiesPath: string): Promise<void> {
   try {
-    const cookiesData = await fs.readFile(cookiesPath, 'utf-8');
+    const validatedPath = validateCookiePath(cookiesPath);
+    const cookiesData = await fs.readFile(validatedPath, 'utf-8');
     const cookies = JSON.parse(cookiesData);
     await page.context().addCookies(cookies);
-    console.error(`Loaded ${cookies.length} cookies from ${cookiesPath}`);
+    console.error(`Loaded ${cookies.length} cookies from ${validatedPath}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
@@ -88,7 +134,7 @@ server.addTool({
   name: 'screenshot',
   description: 'Navigate to a URL and take a screenshot of the webpage',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     fullPage: z.boolean().default(true).describe('Whether to take a screenshot of the full page'),
     selector: z.string().optional().describe('CSS selector to screenshot a specific element'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode'),
@@ -100,8 +146,9 @@ server.addTool({
     const operation = async () => {
       // Launch browser with stealth mode
       const browser = await chromium.launch({ ...launchOptions, headless });
+      let page: Page | null = null;
       try {
-        const page = await browser.newPage();
+        page = await browser.newPage();
 
         if (cookiesPath) {
           await loadCookies(page, cookiesPath);
@@ -139,8 +186,7 @@ server.addTool({
           ]
         };
       } catch (error) {
-        if (enableScreenshotOnError) {
-          const page = await browser.newPage();
+        if (enableScreenshotOnError && page) {
           await screenshotOnError(page, error instanceof Error ? error : new Error(String(error)));
         }
         throw error;
@@ -162,7 +208,7 @@ server.addTool({
   name: 'navigate',
   description: 'Navigate to a URL in a browser session',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
   }),
@@ -192,7 +238,7 @@ server.addTool({
   name: 'click',
   description: 'Click an element on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of element to click'),
     waitAfterClick: z.number().default(1000).describe('Milliseconds to wait after clicking'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
@@ -209,7 +255,7 @@ server.addTool({
       await page.click(selector);
 
       if (waitAfterClick > 0) {
-        await page.waitForTimeout(waitAfterClick);
+        await new Promise(resolve => setTimeout(resolve, waitAfterClick));
       }
 
       return {
@@ -231,7 +277,7 @@ server.addTool({
   name: 'type',
   description: 'Type text into an input field',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of input element'),
     text: z.string().describe('Text to type'),
     clearFirst: z.boolean().default(true).describe('Whether to clear the field before typing'),
@@ -271,7 +317,7 @@ server.addTool({
   name: 'waitForSelector',
   description: 'Wait for an element to appear on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector to wait for'),
     timeout: z.number().default(30000).describe('Maximum time to wait in milliseconds (default: 30000)'),
     state: z.enum(['attached', 'detached', 'visible', 'hidden']).default('visible').describe('State to wait for'),
@@ -307,7 +353,7 @@ server.addTool({
   name: 'getText',
   description: 'Get text content from an element on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of element to get text from'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
   }),
@@ -346,18 +392,23 @@ server.addTool({
   name: 'generateTOTP',
   description: 'Generate a TOTP (Time-based One-Time Password) code from a base32 secret',
   parameters: z.object({
-    secret: z.string().describe('Base32-encoded TOTP secret (e.g., from environment variable)'),
+    secret: z.string().optional().describe('Base32-encoded TOTP secret (provide this OR secretEnvVar)'),
+    secretEnvVar: z.string().optional().describe('Environment variable name containing the TOTP secret (provide this OR secret)'),
     algorithm: z.enum(['SHA1', 'SHA256', 'SHA512']).default('SHA1').describe('Hash algorithm (default: SHA1)'),
     digits: z.number().default(6).describe('Number of digits in the code (default: 6)'),
     period: z.number().default(30).describe('Time period in seconds (default: 30)')
   }),
-  execute: async ({ secret, algorithm = 'SHA1', digits = 6, period = 30 }) => {
+  execute: async ({ secret, secretEnvVar, algorithm = 'SHA1', digits = 6, period = 30 }) => {
+    const totpSecret = secretEnvVar ? process.env[secretEnvVar] : secret;
+    if (!totpSecret) {
+      throw new Error('Either secret or secretEnvVar must be provided');
+    }
     try {
       const totp = new OTPAuth.TOTP({
         algorithm,
         digits,
         period,
-        secret
+        secret: totpSecret
       });
 
       const code = totp.generate();
@@ -381,15 +432,20 @@ server.addTool({
   name: 'enterMFA',
   description: 'Generate TOTP code and enter it into an MFA input field on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of MFA input field'),
-    secret: z.string().describe('Base32-encoded TOTP secret'),
+    secret: z.string().optional().describe('Base32-encoded TOTP secret (provide this OR secretEnvVar)'),
+    secretEnvVar: z.string().optional().describe('Environment variable name containing the TOTP secret (provide this OR secret)'),
     submitAfter: z.boolean().default(false).describe('Whether to submit form after entering code'),
     submitSelector: z.string().optional().describe('CSS selector of submit button (if submitAfter is true)'),
     waitAfterEnter: z.number().default(1000).describe('Milliseconds to wait after entering code'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
   }),
-  execute: async ({ url, selector, secret, submitAfter = false, submitSelector, waitAfterEnter = 1000, headless = true }) => {
+  execute: async ({ url, selector, secret, secretEnvVar, submitAfter = false, submitSelector, waitAfterEnter = 1000, headless = true }) => {
+    const totpSecret = secretEnvVar ? process.env[secretEnvVar] : secret;
+    if (!totpSecret) {
+      throw new Error('Either secret or secretEnvVar must be provided');
+    }
     const browser = await chromium.launch({ ...launchOptions, headless });
     try {
       const page = await browser.newPage();
@@ -402,17 +458,17 @@ server.addTool({
         algorithm: 'SHA1',
         digits: 6,
         period: 30,
-        secret
+        secret: totpSecret
       });
       const code = totp.generate();
-      console.error(`Generated TOTP code: ${code}`);
+      console.error(`TOTP generated successfully`);
 
       // Enter the code
       console.error(`Entering MFA code into element: ${selector}...`);
       await page.fill(selector, code);
 
       if (waitAfterEnter > 0) {
-        await page.waitForTimeout(waitAfterEnter);
+        await new Promise(resolve => setTimeout(resolve, waitAfterEnter));
       }
 
       // Submit if requested
@@ -422,7 +478,7 @@ server.addTool({
         }
         console.error(`Clicking submit button: ${submitSelector}...`);
         await page.click(submitSelector);
-        await page.waitForTimeout(1000);
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
       return {
@@ -448,7 +504,7 @@ server.addTool({
   name: 'saveCookies',
   description: 'Navigate to a URL and save browser cookies to a file for later reuse',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to before saving cookies'),
+    url: z.string().url().describe('URL to navigate to before saving cookies'),
     cookiesPath: z.string().describe('Path to save cookies file (e.g., "./cookies/session.json")'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
@@ -482,7 +538,7 @@ server.addTool({
   name: 'loadCookies',
   description: 'Navigate to a URL with previously saved cookies loaded',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     cookiesPath: z.string().describe('Path to cookies file (e.g., "./cookies/session.json")'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
@@ -516,7 +572,7 @@ server.addTool({
   name: 'extractTable',
   description: 'Extract HTML table data to JSON format from a webpage',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     tableSelector: z.string().default('table').describe('CSS selector for the table element (default: "table")'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode'),
     cookiesPath: z.string().optional().describe('Optional path to cookies file to load before navigation')
@@ -589,6 +645,317 @@ server.addTool({
     } finally {
       await browser.close();
     }
+  }
+});
+
+// Add createSession tool
+server.addTool({
+  name: 'createSession',
+  description: 'Create a persistent browser session for multi-step workflows',
+  parameters: z.object({
+    url: z.string().url().describe('URL to navigate to initially'),
+    headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
+  }),
+  execute: async ({ url, headless = true }) => {
+    cleanupStaleSessions();
+
+    const browser = await chromium.launch({ ...launchOptions, headless });
+    const page = await browser.newPage();
+
+    console.error(`Navigating to ${url}...`);
+    await page.goto(url, { waitUntil: 'load' });
+
+    const sessionId = randomUUID();
+    sessions.set(sessionId, {
+      browser,
+      page,
+      createdAt: new Date()
+    });
+
+    console.error(`Created session: ${sessionId}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            sessionId,
+            message: `Session created and navigated to ${url}`,
+            url
+          }, null, 2)
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionClick tool
+server.addTool({
+  name: 'sessionClick',
+  description: 'Click an element in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector of element to click'),
+    waitAfter: z.number().default(1000).describe('Milliseconds to wait after clicking (default: 1000)')
+  }),
+  execute: async ({ sessionId, selector, waitAfter = 1000 }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Clicking element: ${selector}...`);
+    await session.page.click(selector);
+
+    if (waitAfter > 0) {
+      await new Promise(resolve => setTimeout(resolve, waitAfter));
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully clicked element: ${selector}`
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionType tool
+server.addTool({
+  name: 'sessionType',
+  description: 'Type text into an input field in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector of input element'),
+    text: z.string().describe('Text to type'),
+    clearFirst: z.boolean().default(true).describe('Whether to clear the field before typing (default: true)')
+  }),
+  execute: async ({ sessionId, selector, text, clearFirst = true }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Typing into element: ${selector}...`);
+    if (clearFirst) {
+      await session.page.fill(selector, text);
+    } else {
+      await session.page.type(selector, text);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully typed text into: ${selector}`
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionScreenshot tool
+server.addTool({
+  name: 'sessionScreenshot',
+  description: 'Take a screenshot in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    fullPage: z.boolean().default(true).describe('Whether to take a screenshot of the full page (default: true)'),
+    selector: z.string().optional().describe('CSS selector to screenshot a specific element')
+  }),
+  execute: async ({ sessionId, fullPage = true, selector }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    let screenshot;
+    if (selector) {
+      const element = await session.page.$(selector);
+      if (!element) {
+        throw new Error(`Element with selector '${selector}' not found`);
+      }
+      screenshot = await element.screenshot();
+    } else {
+      screenshot = await session.page.screenshot({ fullPage });
+    }
+
+    return {
+      content: [
+        {
+          type: 'image' as const,
+          data: screenshot.toString('base64'),
+          mimeType: 'image/png'
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionGetText tool
+server.addTool({
+  name: 'sessionGetText',
+  description: 'Get text content from an element in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector of element to get text from')
+  }),
+  execute: async ({ sessionId, selector }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Getting text from element: ${selector}...`);
+    const element = await session.page.$(selector);
+    if (!element) {
+      throw new Error(`Element with selector '${selector}' not found`);
+    }
+
+    const text = await element.textContent();
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: text || ''
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionWait tool
+server.addTool({
+  name: 'sessionWait',
+  description: 'Wait for a selector to appear in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector to wait for'),
+    timeout: z.number().default(30000).describe('Maximum time to wait in milliseconds (default: 30000)')
+  }),
+  execute: async ({ sessionId, selector, timeout = 30000 }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Waiting for selector: ${selector}...`);
+    await session.page.waitForSelector(selector, { timeout });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully found element: ${selector}`
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionNavigate tool
+server.addTool({
+  name: 'sessionNavigate',
+  description: 'Navigate to a new URL in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    url: z.string().url().describe('URL to navigate to'),
+    waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded')
+  }),
+  execute: async ({ sessionId, url, waitUntil = 'load' }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Navigating to ${url}...`);
+    await session.page.goto(url, { waitUntil });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully navigated to ${url}`
+        }
+      ]
+    };
+  }
+});
+
+// Add closeSession tool
+server.addTool({
+  name: 'closeSession',
+  description: 'Close an existing browser session and clean up resources',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession')
+  }),
+  execute: async ({ sessionId }) => {
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    await session.browser.close();
+    sessions.delete(sessionId);
+    console.error(`Closed session: ${sessionId}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully closed session: ${sessionId}`
+        }
+      ]
+    };
+  }
+});
+
+// Add listSessions tool
+server.addTool({
+  name: 'listSessions',
+  description: 'List all active browser sessions with their IDs and ages',
+  parameters: z.object({}),
+  execute: async () => {
+    cleanupStaleSessions();
+
+    const sessionList = Array.from(sessions.entries()).map(([sessionId, session]) => {
+      const ageMs = Date.now() - session.createdAt.getTime();
+      const ageMinutes = Math.floor(ageMs / 60000);
+      const ageSeconds = Math.floor((ageMs % 60000) / 1000);
+
+      return {
+        sessionId,
+        createdAt: session.createdAt.toISOString(),
+        age: `${ageMinutes}m ${ageSeconds}s`
+      };
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            totalSessions: sessionList.length,
+            sessions: sessionList
+          }, null, 2)
+        }
+      ]
+    };
   }
 });
 
