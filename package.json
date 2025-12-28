@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "fastmcp": "^1.19.0",
+    "otpauth": "^9.4.1",
     "playwright": "^1.50.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
