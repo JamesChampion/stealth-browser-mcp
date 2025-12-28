@@ -32,3 +32,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Test results and screenshots
+TEST-RESULTS.md
+*.png
+
+# Test scripts
+test-*.ts
