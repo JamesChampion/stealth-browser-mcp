@@ -41,11 +41,12 @@ function cleanupStaleSessions(): void {
   }
 }
 
-// Browser launch options for Microsoft Edge on Windows (via WSL)
-// Can be overridden with BROWSER_PATH environment variable
-const launchOptions = {
-  executablePath: process.env.BROWSER_PATH || '/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
-};
+// Browser launch options
+// Uses Playwright's bundled Chromium by default for best compatibility
+// Can be overridden with BROWSER_PATH environment variable to use a custom browser
+const launchOptions = process.env.BROWSER_PATH 
+  ? { executablePath: process.env.BROWSER_PATH }
+  : {};
 
 // Helper: Retry wrapper with exponential backoff
 async function withRetry<T>(
