@@ -8,7 +8,8 @@
   "email": "newbeb@gmail.com",
   "description": "A MCP Server that provides browser access through playwright with \"stealth mode\" enabled.",
   "scripts": {
-    "start": "bun run index.ts",
+    "start": "npx tsx index.ts",
+    "start:bun": "bun run index.ts",
     "dev": "fastmcp dev index.ts",
     "inspect": "fastmcp inspect index.ts"
   },
