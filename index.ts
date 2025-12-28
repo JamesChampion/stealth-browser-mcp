@@ -53,22 +53,37 @@ async function screenshotOnError(page: Page, error: Error): Promise<void> {
   }
 }
 
+// Helper: Validate cookie path to prevent path traversal
+function validateCookiePath(cookiesPath: string): string {
+  const allowedBase = process.env.COOKIES_BASE_DIR || process.cwd();
+  const resolvedPath = path.resolve(cookiesPath);
+  const resolvedBase = path.resolve(allowedBase);
+
+  if (!resolvedPath.startsWith(resolvedBase)) {
+    throw new Error(`Cookie path must be within ${resolvedBase}`);
+  }
+
+  return resolvedPath;
+}
+
 // Helper: Save cookies to file
 async function saveCookies(page: Page, cookiesPath: string): Promise<void> {
+  const validatedPath = validateCookiePath(cookiesPath);
   const cookies = await page.context().cookies();
-  const dir = path.dirname(cookiesPath);
+  const dir = path.dirname(validatedPath);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(cookiesPath, JSON.stringify(cookies, null, 2));
-  console.error(`Saved ${cookies.length} cookies to ${cookiesPath}`);
+  await fs.writeFile(validatedPath, JSON.stringify(cookies, null, 2));
+  console.error(`Saved ${cookies.length} cookies to ${validatedPath}`);
 }
 
 // Helper: Load cookies from file
 async function loadCookies(page: Page, cookiesPath: string): Promise<void> {
   try {
-    const cookiesData = await fs.readFile(cookiesPath, 'utf-8');
+    const validatedPath = validateCookiePath(cookiesPath);
+    const cookiesData = await fs.readFile(validatedPath, 'utf-8');
     const cookies = JSON.parse(cookiesData);
     await page.context().addCookies(cookies);
-    console.error(`Loaded ${cookies.length} cookies from ${cookiesPath}`);
+    console.error(`Loaded ${cookies.length} cookies from ${validatedPath}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
@@ -88,7 +103,7 @@ server.addTool({
   name: 'screenshot',
   description: 'Navigate to a URL and take a screenshot of the webpage',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     fullPage: z.boolean().default(true).describe('Whether to take a screenshot of the full page'),
     selector: z.string().optional().describe('CSS selector to screenshot a specific element'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode'),
@@ -100,8 +115,9 @@ server.addTool({
     const operation = async () => {
       // Launch browser with stealth mode
       const browser = await chromium.launch({ ...launchOptions, headless });
+      let page: Page | null = null;
       try {
-        const page = await browser.newPage();
+        page = await browser.newPage();
 
         if (cookiesPath) {
           await loadCookies(page, cookiesPath);
@@ -139,8 +155,7 @@ server.addTool({
           ]
         };
       } catch (error) {
-        if (enableScreenshotOnError) {
-          const page = await browser.newPage();
+        if (enableScreenshotOnError && page) {
           await screenshotOnError(page, error instanceof Error ? error : new Error(String(error)));
         }
         throw error;
@@ -162,7 +177,7 @@ server.addTool({
   name: 'navigate',
   description: 'Navigate to a URL in a browser session',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
   }),
@@ -192,7 +207,7 @@ server.addTool({
   name: 'click',
   description: 'Click an element on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of element to click'),
     waitAfterClick: z.number().default(1000).describe('Milliseconds to wait after clicking'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
@@ -209,7 +224,7 @@ server.addTool({
       await page.click(selector);
 
       if (waitAfterClick > 0) {
-        await page.waitForTimeout(waitAfterClick);
+        await new Promise(resolve => setTimeout(resolve, waitAfterClick));
       }
 
       return {
@@ -231,7 +246,7 @@ server.addTool({
   name: 'type',
   description: 'Type text into an input field',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of input element'),
     text: z.string().describe('Text to type'),
     clearFirst: z.boolean().default(true).describe('Whether to clear the field before typing'),
@@ -271,7 +286,7 @@ server.addTool({
   name: 'waitForSelector',
   description: 'Wait for an element to appear on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector to wait for'),
     timeout: z.number().default(30000).describe('Maximum time to wait in milliseconds (default: 30000)'),
     state: z.enum(['attached', 'detached', 'visible', 'hidden']).default('visible').describe('State to wait for'),
@@ -307,7 +322,7 @@ server.addTool({
   name: 'getText',
   description: 'Get text content from an element on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of element to get text from'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
   }),
@@ -346,18 +361,23 @@ server.addTool({
   name: 'generateTOTP',
   description: 'Generate a TOTP (Time-based One-Time Password) code from a base32 secret',
   parameters: z.object({
-    secret: z.string().describe('Base32-encoded TOTP secret (e.g., from environment variable)'),
+    secret: z.string().optional().describe('Base32-encoded TOTP secret (provide this OR secretEnvVar)'),
+    secretEnvVar: z.string().optional().describe('Environment variable name containing the TOTP secret (provide this OR secret)'),
     algorithm: z.enum(['SHA1', 'SHA256', 'SHA512']).default('SHA1').describe('Hash algorithm (default: SHA1)'),
     digits: z.number().default(6).describe('Number of digits in the code (default: 6)'),
     period: z.number().default(30).describe('Time period in seconds (default: 30)')
   }),
-  execute: async ({ secret, algorithm = 'SHA1', digits = 6, period = 30 }) => {
+  execute: async ({ secret, secretEnvVar, algorithm = 'SHA1', digits = 6, period = 30 }) => {
+    const totpSecret = secretEnvVar ? process.env[secretEnvVar] : secret;
+    if (!totpSecret) {
+      throw new Error('Either secret or secretEnvVar must be provided');
+    }
     try {
       const totp = new OTPAuth.TOTP({
         algorithm,
         digits,
         period,
-        secret
+        secret: totpSecret
       });
 
       const code = totp.generate();
@@ -381,15 +401,20 @@ server.addTool({
   name: 'enterMFA',
   description: 'Generate TOTP code and enter it into an MFA input field on the page',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to first'),
+    url: z.string().url().describe('URL to navigate to first'),
     selector: z.string().describe('CSS selector of MFA input field'),
-    secret: z.string().describe('Base32-encoded TOTP secret'),
+    secret: z.string().optional().describe('Base32-encoded TOTP secret (provide this OR secretEnvVar)'),
+    secretEnvVar: z.string().optional().describe('Environment variable name containing the TOTP secret (provide this OR secret)'),
     submitAfter: z.boolean().default(false).describe('Whether to submit form after entering code'),
     submitSelector: z.string().optional().describe('CSS selector of submit button (if submitAfter is true)'),
     waitAfterEnter: z.number().default(1000).describe('Milliseconds to wait after entering code'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
   }),
-  execute: async ({ url, selector, secret, submitAfter = false, submitSelector, waitAfterEnter = 1000, headless = true }) => {
+  execute: async ({ url, selector, secret, secretEnvVar, submitAfter = false, submitSelector, waitAfterEnter = 1000, headless = true }) => {
+    const totpSecret = secretEnvVar ? process.env[secretEnvVar] : secret;
+    if (!totpSecret) {
+      throw new Error('Either secret or secretEnvVar must be provided');
+    }
     const browser = await chromium.launch({ ...launchOptions, headless });
     try {
       const page = await browser.newPage();
@@ -402,17 +427,17 @@ server.addTool({
         algorithm: 'SHA1',
         digits: 6,
         period: 30,
-        secret
+        secret: totpSecret
       });
       const code = totp.generate();
-      console.error(`Generated TOTP code: ${code}`);
+      console.error(`TOTP generated successfully`);
 
       // Enter the code
       console.error(`Entering MFA code into element: ${selector}...`);
       await page.fill(selector, code);
 
       if (waitAfterEnter > 0) {
-        await page.waitForTimeout(waitAfterEnter);
+        await new Promise(resolve => setTimeout(resolve, waitAfterEnter));
       }
 
       // Submit if requested
@@ -422,7 +447,7 @@ server.addTool({
         }
         console.error(`Clicking submit button: ${submitSelector}...`);
         await page.click(submitSelector);
-        await page.waitForTimeout(1000);
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
       return {
@@ -448,7 +473,7 @@ server.addTool({
   name: 'saveCookies',
   description: 'Navigate to a URL and save browser cookies to a file for later reuse',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to before saving cookies'),
+    url: z.string().url().describe('URL to navigate to before saving cookies'),
     cookiesPath: z.string().describe('Path to save cookies file (e.g., "./cookies/session.json")'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
@@ -482,7 +507,7 @@ server.addTool({
   name: 'loadCookies',
   description: 'Navigate to a URL with previously saved cookies loaded',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     cookiesPath: z.string().describe('Path to cookies file (e.g., "./cookies/session.json")'),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
@@ -516,7 +541,7 @@ server.addTool({
   name: 'extractTable',
   description: 'Extract HTML table data to JSON format from a webpage',
   parameters: z.object({
-    url: z.string().describe('URL to navigate to'),
+    url: z.string().url().describe('URL to navigate to'),
     tableSelector: z.string().default('table').describe('CSS selector for the table element (default: "table")'),
     headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode'),
     cookiesPath: z.string().optional().describe('Optional path to cookies file to load before navigation')
