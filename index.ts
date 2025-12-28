@@ -6,9 +6,40 @@ import * as OTPAuth from 'otpauth';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { Browser, Page } from 'playwright';
+import { randomUUID } from 'crypto';
 
 // Add the stealth plugin to playwright
 chromium.use(StealthPlugin());
+
+// Session storage for persistent browser instances
+interface BrowserSession {
+  browser: Browser;
+  page: Page;
+  createdAt: Date;
+}
+
+const sessions = new Map<string, BrowserSession>();
+
+// Session cleanup: remove sessions older than 30 minutes
+function cleanupStaleSessions(): void {
+  const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+  const staleSessionIds: string[] = [];
+
+  for (const [sessionId, session] of sessions.entries()) {
+    if (session.createdAt < thirtyMinutesAgo) {
+      staleSessionIds.push(sessionId);
+    }
+  }
+
+  for (const sessionId of staleSessionIds) {
+    const session = sessions.get(sessionId);
+    if (session) {
+      session.browser.close().catch(err => console.error(`Error closing stale session ${sessionId}:`, err));
+      sessions.delete(sessionId);
+      console.error(`Cleaned up stale session: ${sessionId}`);
+    }
+  }
+}
 
 // Browser launch options for Microsoft Edge on Windows (via WSL)
 // Can be overridden with BROWSER_PATH environment variable
@@ -614,6 +645,317 @@ server.addTool({
     } finally {
       await browser.close();
     }
+  }
+});
+
+// Add createSession tool
+server.addTool({
+  name: 'createSession',
+  description: 'Create a persistent browser session for multi-step workflows',
+  parameters: z.object({
+    url: z.string().url().describe('URL to navigate to initially'),
+    headless: z.boolean().default(true).describe('Whether to run browser in headless mode (default) or visible mode')
+  }),
+  execute: async ({ url, headless = true }) => {
+    cleanupStaleSessions();
+
+    const browser = await chromium.launch({ ...launchOptions, headless });
+    const page = await browser.newPage();
+
+    console.error(`Navigating to ${url}...`);
+    await page.goto(url, { waitUntil: 'load' });
+
+    const sessionId = randomUUID();
+    sessions.set(sessionId, {
+      browser,
+      page,
+      createdAt: new Date()
+    });
+
+    console.error(`Created session: ${sessionId}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            sessionId,
+            message: `Session created and navigated to ${url}`,
+            url
+          }, null, 2)
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionClick tool
+server.addTool({
+  name: 'sessionClick',
+  description: 'Click an element in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector of element to click'),
+    waitAfter: z.number().default(1000).describe('Milliseconds to wait after clicking (default: 1000)')
+  }),
+  execute: async ({ sessionId, selector, waitAfter = 1000 }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Clicking element: ${selector}...`);
+    await session.page.click(selector);
+
+    if (waitAfter > 0) {
+      await new Promise(resolve => setTimeout(resolve, waitAfter));
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully clicked element: ${selector}`
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionType tool
+server.addTool({
+  name: 'sessionType',
+  description: 'Type text into an input field in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector of input element'),
+    text: z.string().describe('Text to type'),
+    clearFirst: z.boolean().default(true).describe('Whether to clear the field before typing (default: true)')
+  }),
+  execute: async ({ sessionId, selector, text, clearFirst = true }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Typing into element: ${selector}...`);
+    if (clearFirst) {
+      await session.page.fill(selector, text);
+    } else {
+      await session.page.type(selector, text);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully typed text into: ${selector}`
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionScreenshot tool
+server.addTool({
+  name: 'sessionScreenshot',
+  description: 'Take a screenshot in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    fullPage: z.boolean().default(true).describe('Whether to take a screenshot of the full page (default: true)'),
+    selector: z.string().optional().describe('CSS selector to screenshot a specific element')
+  }),
+  execute: async ({ sessionId, fullPage = true, selector }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    let screenshot;
+    if (selector) {
+      const element = await session.page.$(selector);
+      if (!element) {
+        throw new Error(`Element with selector '${selector}' not found`);
+      }
+      screenshot = await element.screenshot();
+    } else {
+      screenshot = await session.page.screenshot({ fullPage });
+    }
+
+    return {
+      content: [
+        {
+          type: 'image' as const,
+          data: screenshot.toString('base64'),
+          mimeType: 'image/png'
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionGetText tool
+server.addTool({
+  name: 'sessionGetText',
+  description: 'Get text content from an element in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector of element to get text from')
+  }),
+  execute: async ({ sessionId, selector }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Getting text from element: ${selector}...`);
+    const element = await session.page.$(selector);
+    if (!element) {
+      throw new Error(`Element with selector '${selector}' not found`);
+    }
+
+    const text = await element.textContent();
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: text || ''
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionWait tool
+server.addTool({
+  name: 'sessionWait',
+  description: 'Wait for a selector to appear in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    selector: z.string().describe('CSS selector to wait for'),
+    timeout: z.number().default(30000).describe('Maximum time to wait in milliseconds (default: 30000)')
+  }),
+  execute: async ({ sessionId, selector, timeout = 30000 }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Waiting for selector: ${selector}...`);
+    await session.page.waitForSelector(selector, { timeout });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully found element: ${selector}`
+        }
+      ]
+    };
+  }
+});
+
+// Add sessionNavigate tool
+server.addTool({
+  name: 'sessionNavigate',
+  description: 'Navigate to a new URL in an existing browser session',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession'),
+    url: z.string().url().describe('URL to navigate to'),
+    waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).default('load').describe('When to consider navigation succeeded')
+  }),
+  execute: async ({ sessionId, url, waitUntil = 'load' }) => {
+    cleanupStaleSessions();
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}. Use createSession first or check if session expired.`);
+    }
+
+    console.error(`Navigating to ${url}...`);
+    await session.page.goto(url, { waitUntil });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully navigated to ${url}`
+        }
+      ]
+    };
+  }
+});
+
+// Add closeSession tool
+server.addTool({
+  name: 'closeSession',
+  description: 'Close an existing browser session and clean up resources',
+  parameters: z.object({
+    sessionId: z.string().describe('Session ID from createSession')
+  }),
+  execute: async ({ sessionId }) => {
+    const session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    await session.browser.close();
+    sessions.delete(sessionId);
+    console.error(`Closed session: ${sessionId}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Successfully closed session: ${sessionId}`
+        }
+      ]
+    };
+  }
+});
+
+// Add listSessions tool
+server.addTool({
+  name: 'listSessions',
+  description: 'List all active browser sessions with their IDs and ages',
+  parameters: z.object({}),
+  execute: async () => {
+    cleanupStaleSessions();
+
+    const sessionList = Array.from(sessions.entries()).map(([sessionId, session]) => {
+      const ageMs = Date.now() - session.createdAt.getTime();
+      const ageMinutes = Math.floor(ageMs / 60000);
+      const ageSeconds = Math.floor((ageMs % 60000) / 1000);
+
+      return {
+        sessionId,
+        createdAt: session.createdAt.toISOString(),
+        age: `${ageMinutes}m ${ageSeconds}s`
+      };
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            totalSessions: sessionList.length,
+            sessions: sessionList
+          }, null, 2)
+        }
+      ]
+    };
   }
 });
 
